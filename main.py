@@ -4,109 +4,125 @@ from threading import Thread
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-# ===== CONFIG =====
-api_id = int(os.environ.get("API_ID"))
+# ================== CONFIG ==================
+api_id = os.environ.get("API_ID")
 api_hash = os.environ.get("API_HASH")
 session_string = os.environ.get("SESSION_STRING")
 
-# ===== KEEP RENDER ALIVE =====
-app = Flask(__name__)
+if not api_id or not api_hash or not session_string:
+    raise RuntimeError("Missing environment variables")
 
-@app.route("/")
+api_id = int(api_id)
+
+# ================== KEEP RENDER ALIVE ==================
+app = Flask('')
+
+@app.route('/')
 def home():
     return "I am alive!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
     Thread(target=run_web).start()
 
-# ===== TELEGRAM CLIENT =====
+# ================== TELEGRAM CLIENT ==================
 client = TelegramClient(StringSession(session_string), api_id, api_hash)
 
-TEMP_FOLDER = "downloads"
-os.makedirs(TEMP_FOLDER, exist_ok=True)
+temp_folder = "downloads"
+os.makedirs(temp_folder, exist_ok=True)
 
 def get_chat_id_and_msg_id(link):
     try:
-        if "t.me/c/" in link:
-            parts = link.split("/")
-            return int("-100" + parts[-2]), int(parts[-1])
-        elif "t.me/" in link:
-            parts = link.split("/")
-            return parts[-2], int(parts[-1])
+        if 't.me/c/' in link:
+            parts = link.split('/')
+            chat_id = int('-100' + parts[-2])
+            msg_id = int(parts[-1])
+            return chat_id, msg_id
+        elif 't.me/' in link:
+            parts = link.split('/')
+            chat_id = parts[-2]
+            msg_id = int(parts[-1])
+            return chat_id, msg_id
     except:
         pass
     return None, None
 
-@client.on(events.NewMessage(chats="me"))
+@client.on(events.NewMessage(chats='me'))
 async def handler(event):
-    text = event.raw_text
+    text = event.message.text
 
-    if not text.startswith("/save"):
-        return
+    if text and text.startswith('/save'):
+        try:
+            link = text.split()[1]
+            status_msg = await event.reply("⏳ กำลังทำงาน...")
 
-    try:
-        link = text.split()[1]
-    except:
-        await event.reply("❌ ใส่ลิงก์มาด้วย")
-        return
+            chat_id, msg_id = get_chat_id_and_msg_id(link)
+            if not chat_id:
+                await status_msg.edit("❌ ลิงก์ไม่ถูกต้อง")
+                return
 
-    status = await event.reply("⏳ กำลังทำงาน...")
+            msg = await client.get_messages(chat_id, ids=msg_id)
 
-    chat_id, msg_id = get_chat_id_and_msg_id(link)
-    if not chat_id:
-        await status.edit("❌ ลิงก์ไม่ถูกต้อง")
-        return
+            if not msg:
+                await status_msg.edit("❌ หาโพสต์ไม่เจอ")
+                return
 
-    msg = await client.get_messages(chat_id, ids=msg_id)
-    if not msg:
-        await status.edit("❌ ไม่พบข้อความ")
-        return
+            # ====== ถ้าเป็นอัลบั้ม ======
+            if msg.grouped_id:
+                await status_msg.edit("⬇️ กำลังโหลดอัลบั้ม...")
 
-    messages_to_download = []
+                album = await client.get_messages(
+                    chat_id,
+                    min_id=msg.id - 20,
+                    max_id=msg.id + 20
+                )
 
-    # ===== รองรับ Album =====
-    if msg.grouped_id:
-        async for m in client.iter_messages(chat_id, reverse=True):
-            if m.grouped_id == msg.grouped_id:
-                if m.photo or m.video or m.document:
-                    messages_to_download.append(m)
-            elif messages_to_download:
-                break
-    else:
-        if msg.photo or msg.video or msg.document:
-            messages_to_download.append(msg)
+                media_files = []
 
-    if not messages_to_download:
-        await status.edit("❌ ไม่พบสื่อในโพสต์นี้")
-        return
+                for m in album:
+                    if m.grouped_id == msg.grouped_id and (m.photo or m.video or m.document):
+                        file_name = m.file.name or f"{m.id}"
+                        save_path = os.path.join(temp_folder, file_name)
+                        await client.download_media(m, save_path)
+                        media_files.append(save_path)
 
-    await status.edit(f"⬇️ กำลังโหลด {len(messages_to_download)} ไฟล์...")
+                if media_files:
+                    await status_msg.edit("⬆️ กำลังส่งอัลบั้ม...")
+                    await event.reply(file=media_files)
 
-    downloaded_files = []
+                    for f in media_files:
+                        os.remove(f)
 
-    for m in messages_to_download:
-        file_path = await client.download_media(
-            m,
-            file=os.path.join(TEMP_FOLDER, "")
-        )
-        if file_path:
-            downloaded_files.append(file_path)
+                    await status_msg.delete()
+                else:
+                    await status_msg.edit("❌ ไม่พบสื่อในอัลบั้ม")
 
-    await status.edit("⬆️ กำลังอัปโหลดกลับ...")
+            # ====== สื่อเดี่ยว ======
+            else:
+                if msg.photo or msg.video or msg.document:
+                    file_name = msg.file.name or f"{msg.id}"
+                    save_path = os.path.join(temp_folder, file_name)
 
-    await client.send_file(
-        "me",
-        downloaded_files,
-        caption=f"บันทึกแล้ว {len(downloaded_files)} ไฟล์"
-    )
+                    await status_msg.edit("⬇️ กำลังโหลด...")
+                    await client.download_media(msg, save_path)
 
-    # ลบไฟล์ชั่วคราว
-    for f in downloaded_files:
-        if os.path.exists(f):
-            os.remove(f)
+                    await status_msg.edit("⬆️ กำลังส่ง...")
+                    await event.reply(file=save_path)
 
-    await status.edit("✅ เสร็จแล้ว")
+                    os.remove(save_path)
+                    await status_msg.delete()
+                else:
+                    await status_msg.edit("❌ ไม่พบสื่อ")
+
+        except Exception as e:
+            await event.reply(f"❌ Error: {e}")
+
+# ================== START ==================
+if __name__ == "__main__":
+    keep_alive()
+    print("Bot Started...")
+    client.start()
+    client.run_until_disconnected()
